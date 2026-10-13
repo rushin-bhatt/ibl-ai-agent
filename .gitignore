@@ -30,3 +30,4 @@ pytest.ini
 .deepeval/
 tests/evals/.env.local
 tests/evals/models.json
+tests/evals/results/
