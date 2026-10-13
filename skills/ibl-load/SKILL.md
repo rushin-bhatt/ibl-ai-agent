@@ -1,6 +1,6 @@
 ---
 name: ibl-load
-description: Use this skill when loading IBL data, preferring the smallest sufficient local or aggregate surface before session-level loaders.
+description: Use this skill when loading IBL data — spikes, autocorrelograms, LFP, or behavioral measurements. Required whenever a question needs data loaded before analysis.
 ---
 
 # IBL Load
