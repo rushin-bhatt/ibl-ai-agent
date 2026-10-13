@@ -1,0 +1,145 @@
+name: nightly-evals
+
+# Runs the deepeval questions in tests/evals/questions against one model per
+# provider (Claude, Mistral, Lightning), every night and on demand.
+#
+# Required repository secrets:
+#   ANTHROPIC_API_KEY  Claude, through claude-agent-sdk
+#   MISTRAL_API_KEY    Mistral
+#   LITAI_API_KEY      Lightning AI
+#
+# A failing model is a measurement, not a broken build: the job only fails when
+# the harness itself breaks (setup, data, collection). Results are uploaded as
+# an artifact and written to the run summary.
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # 06:00 UTC, 02:00 New York
+  workflow_dispatch:
+    inputs:
+      models_file:
+        description: "Model grid, relative to the repo root"
+        default: "tests/evals/models.default.json"
+
+concurrency:
+  group: nightly-evals
+  cancel-in-progress: false
+
+env:
+  UV_CACHE_DIR: .uv-cache
+  MODELS_FILE: ${{ inputs.models_file || 'tests/evals/models.default.json' }}
+  # Keep in sync with ARCHIVES in scripts/download_datasets.py.
+  BWM_EPHYS_VERSION: "1.2.1"
+  BWM_EPHYS_SHA1: "b18c5c7a2944be510800010eb3df90aac84a2a52"
+
+jobs:
+  evals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          # Same pin as ci.yaml; see the note there.
+          version: "0.12.13"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install dependencies
+        run: uv sync --extra dev --extra evals
+
+      # The questions only read metadata and feature tables. The spike arrays
+      # are most of the 6 GB archive, so they are skipped at extraction and
+      # the slim copy is cached across nights.
+      - name: Restore bwm_ephys (without spikes)
+        id: data-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: reports/datasets/bwm_ephys/${{ env.BWM_EPHYS_VERSION }}
+          key: bwm_ephys-${{ env.BWM_EPHYS_VERSION }}-nospikes-${{ env.BWM_EPHYS_SHA1 }}
+      - name: Download bwm_ephys (without spikes)
+        if: steps.data-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p reports/datasets
+          url="https://ibl-brain-wide-map-public.s3.amazonaws.com/resources/ibl-agent-data/bwm_ephys-${BWM_EPHYS_VERSION}.tar"
+          curl -sSfL "$url" \
+            | tee >(sha1sum | cut -d' ' -f1 > "$RUNNER_TEMP/bwm_ephys.sha1") \
+            | tar -x -C reports/datasets --exclude="bwm_ephys/${BWM_EPHYS_VERSION}/spikes/*"
+          sleep 1  # let the sha1sum process substitution finish writing
+          test "$(cat "$RUNNER_TEMP/bwm_ephys.sha1")" = "$BWM_EPHYS_SHA1" \
+            || { echo "::error::bwm_ephys sha1 mismatch"; exit 1; }
+      # Saved here rather than at job end: actions/cache only saves on success,
+      # and a night with failing evals should not download 6 GB again.
+      - name: Cache bwm_ephys (without spikes)
+        if: steps.data-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: reports/datasets/bwm_ephys/${{ env.BWM_EPHYS_VERSION }}
+          key: ${{ steps.data-cache.outputs.cache-primary-key }}
+      - name: Configure data locations
+        run: |
+          cat > data_locations.local.yaml <<EOF
+          datasets:
+            bwm_ephys:
+              root: ${GITHUB_WORKSPACE}/reports/datasets/bwm_ephys
+              preferred_version: latest
+          EOF
+          uv run --no-sync python -c \
+            "from ibl_ai_agent.data_locations import resolve_dataset_dir; print(resolve_dataset_dir('bwm_ephys'))"
+
+      - name: Unit tests (mocked, no network)
+        run: uv run --no-sync pytest -q tests/evals
+
+      - name: Check API keys
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          LITAI_API_KEY: ${{ secrets.LITAI_API_KEY }}
+        run: |
+          # A missing key would otherwise surface as every model of that
+          # provider failing, which reads like a result.
+          for key in ANTHROPIC_API_KEY MISTRAL_API_KEY LITAI_API_KEY; do
+            if [ -z "${!key}" ]; then echo "::error::secret $key is not set"; missing=1; fi
+          done
+          exit "${missing:-0}"
+
+      - name: Live evals
+        id: evals
+        env:
+          RUN_LIVE_EVALS: "1"
+          # Answers must come from the cached local data, not live Alyx/ONE.
+          IBL_AGENT_DATA_OFFLINE: "1"
+          EVAL_MODELS_FILE: ${{ env.MODELS_FILE }}
+          EVAL_RESULTS_DIR: ${{ runner.temp }}/eval-results
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          LITAI_API_KEY: ${{ secrets.LITAI_API_KEY }}
+        run: |
+          set +e
+          uv run --no-sync pytest tests/evals/test_dataloading.py tests/evals/test_skill_selection.py \
+            -n 3 -rA --junitxml="$EVAL_RESULTS_DIR/junit.xml"
+          code=$?
+          set -e
+          # pytest exit 1 means some evals failed, which is the expected
+          # outcome. Anything above 1 (interrupted, collection or usage error,
+          # nothing collected) is a broken harness.
+          if [ "$code" -gt 1 ]; then exit "$code"; fi
+
+      - name: Summarize
+        if: always() && steps.evals.outcome != 'skipped'
+        env:
+          EVAL_RESULTS_DIR: ${{ runner.temp }}/eval-results
+        run: |
+          uv run --no-sync python tests/evals/summarize_results.py
+          {
+            echo "Commit \`${GITHUB_SHA::7}\`, models from \`${MODELS_FILE}\`."
+            echo
+            cat "$EVAL_RESULTS_DIR/summary.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload results
+        if: always() && steps.evals.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results-${{ github.run_id }}
+          path: ${{ runner.temp }}/eval-results
+          retention-days: 90
