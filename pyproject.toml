@@ -28,6 +28,7 @@ evals = [
   "deepeval>=4.0.7",
   "python-dotenv>=1.0",
   "pytest-xdist>=3.5",
+  "claude-agent-sdk>=0.1",
 ]
 ibl = [
   "ONE-api>=3.0",
