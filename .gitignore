@@ -27,4 +27,6 @@ questions/projects/**/_tmp/
 projects/*
 data/*
 pytest.ini
-
+.deepeval/
+tests/evals/.env.local
+tests/evals/models.json
