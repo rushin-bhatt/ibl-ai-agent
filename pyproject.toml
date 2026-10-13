@@ -30,6 +30,7 @@ evals = [
   "pytest-xdist>=3.5",
   "claude-agent-sdk>=0.1",
   "openai>=1.0",
+  "mistralai>=1.9",
 ]
 ibl = [
   "ONE-api>=3.0",
